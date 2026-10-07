@@ -227,3 +227,82 @@ func TestPESSpanningManyPackets(t *testing.T) {
 		t.Errorf("pesBytes = %d, want %d", got, 6+0xFFFF)
 	}
 }
+
+// multiErrorBoundedFragment reproduces the archival scenario: packet 3 is the
+// media PID's first payload with a legal continuity counter but PUSI clear
+// (bounded-PES violation), and packet 4 has a corrupt sync byte.
+func multiErrorBoundedFragment() []byte {
+	b := tsbuild.New()
+	b.AddPAT()                                       // 0
+	b.AddPMT()                                       // 1
+	b.AddPCR(b.Opt.PCRPID, 0)                        // 2
+	b.AddPayload(b.Opt.Media[0].PID)                 // 3: PUSI clear, CC legal
+	b.AddPayload(b.Opt.Media[0].PID)                 // 4: CC legal ...
+	b.MutateLast(func(buf []byte) { buf[0] = 0x00 }) //    ... but sync byte 0x00
+	return b.Bytes()
+}
+
+func TestPESBoundedEarlierViolationBeatsLaterBadSync(t *testing.T) {
+	_, err := tsaudit.AuditPESBounded(multiErrorBoundedFragment(), 1000, true)
+	if err == nil {
+		t.Fatal("stream must be rejected")
+	}
+	if err.Code != tsaudit.ErrPESMissingPUSI {
+		t.Fatalf("code = %s, want %s (later bad sync must not mask it)", err.Code, tsaudit.ErrPESMissingPUSI)
+	}
+	if err.Packet != 3 {
+		t.Errorf("packet = %d, want 3", err.Packet)
+	}
+	if err.PID != 0x0101 {
+		t.Errorf("pid = %#x, want 0x0101", err.PID)
+	}
+}
+
+func TestPESBoundedSingleMissingPUSIControl(t *testing.T) {
+	b := tsbuild.New()
+	b.AddPAT()
+	b.AddPMT()
+	b.AddPCR(b.Opt.PCRPID, 0)
+	b.AddPayload(b.Opt.Media[0].PID) // packet 3 alone violates bounded PES
+	_, err := tsaudit.AuditPESBounded(b.Bytes(), 1000, true)
+	if err == nil || err.Code != tsaudit.ErrPESMissingPUSI {
+		t.Fatalf("want %s, got %v", tsaudit.ErrPESMissingPUSI, err)
+	}
+	if err.Packet != 3 || err.PID != 0x0101 {
+		t.Errorf("location = packet %d pid %#x, want 3 / 0x0101", err.Packet, err.PID)
+	}
+}
+
+func TestPESBoundedSingleBadSyncControl(t *testing.T) {
+	b := tsbuild.New()
+	b.AddPAT()
+	b.AddPMT()
+	b.AddPCR(b.Opt.PCRPID, 0)
+	b.AddPayload(b.Opt.Media[0].PID) // packet 3 ...
+	b.MutateLast(func(buf []byte) { buf[0] = 0x00 })
+	_, err := tsaudit.AuditPESBounded(b.Bytes(), 1000, true)
+	if err == nil || err.Code != tsaudit.ErrBadSyncByte {
+		t.Fatalf("want %s, got %v", tsaudit.ErrBadSyncByte, err)
+	}
+	if err.Packet != 3 {
+		t.Errorf("packet = %d, want 3", err.Packet)
+	}
+	if err.PID != -1 {
+		t.Errorf("pid = %d, want -1 (no PID for a bad sync byte)", err.PID)
+	}
+}
+
+func TestPESBoundedDisabledKeepsHeaderErrorFirst(t *testing.T) {
+	// Without pes=bounded the PES layer is absent: the later packet-header
+	// corruption remains the reported error, exactly as before.
+	_, err := tsaudit.AuditPESBounded(multiErrorBoundedFragment(), 1000, false)
+	if err == nil || err.Code != tsaudit.ErrBadSyncByte {
+		t.Fatalf("want %s, got %v", tsaudit.ErrBadSyncByte, err)
+	}
+	if err.Packet != 4 {
+		t.Errorf("packet = %d, want 4", err.Packet)
+	}
+	if err.PID != -1 {
+		t.Errorf("pid = %d, want -1", err.PID)
+	}
+}

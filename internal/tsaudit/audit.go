@@ -74,6 +74,12 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	}
 	n := len(data) / packetSize
 	pkts := make([]*Packet, n)
+	// pktErrs collects per-packet header failures while pes=bounded delays the
+	// verdict: the first violation in input order (media payload framing
+	// included) must win, so a later corrupt packet header cannot mask an
+	// earlier bounded-PES violation. The slots stay nil on the legacy path,
+	// where such failures remain immediate.
+	pktErrs := make([]*AuditError, n)
 
 	// ---- Pass A: per-packet header rules + PAT collection ----------------
 	var pats []*tableSection
@@ -82,15 +88,23 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 		raw := data[off : off+packetSize : off+packetSize]
 		p, err := parsePacket(raw, i)
 		if err != nil {
-			return nil, err
+			if !pesBounded {
+				return nil, err
+			}
+			pktErrs[i] = err
+			continue
 		}
 		pkts[i] = p
 
 		if p.HasAdaptation && len(p.Adaptation) > 0 && p.Adaptation[0]&afFlagDiscontinuity != 0 {
-			return nil, auditError(ErrDiscontinuity, "adaptation field discontinuity indicator set", i, p.PID)
+			dErr := auditError(ErrDiscontinuity, "adaptation field discontinuity indicator set", i, p.PID)
+			if !pesBounded {
+				return nil, dErr
+			}
+			pktErrs[i] = dErr
 		}
 
-		if p.PID == pidPAT {
+		if p != nil && pktErrs[i] == nil && p.PID == pidPAT {
 			if !p.PUSI {
 				return nil, auditError(ErrPATSectionSpansPacket, "PAT continuation packet: section is not contained in one packet", i, p.PID)
 			}
@@ -103,6 +117,9 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	}
 
 	if len(pats) == 0 {
+		if e := firstDeferredError(pktErrs); e != nil {
+			return nil, e
+		}
 		return nil, auditError(ErrPATNotFound, "no PAT found on PID 0x0000", 0, pidPAT)
 	}
 	pat := pats[0]
@@ -125,7 +142,7 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	// ---- Pass B: PMT collection on the PAT-signalled PID -----------------
 	var pmts []*tableSection
 	for i, p := range pkts {
-		if p.PID != prog.pid {
+		if p == nil || pktErrs[i] != nil || p.PID != prog.pid {
 			continue
 		}
 		if !p.PUSI {
@@ -139,6 +156,9 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 		pmts = append(pmts, sec)
 	}
 	if len(pmts) == 0 {
+		if e := firstDeferredError(pktErrs); e != nil {
+			return nil, e
+		}
 		return nil, auditError(ErrPMTNotFound, "no PMT found on the PAT-signalled PID", 0, prog.pid)
 	}
 	pmt := pmts[0]
@@ -192,6 +212,14 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	var payloadTotal int64
 
 	for i, p := range pkts {
+		if e := pktErrs[i]; e != nil {
+			// pes=bounded only: an earlier media payload violation has not
+			// been found, so the header corruption is now the first verdict.
+			return nil, e
+		}
+		if p == nil {
+			continue
+		}
 		if p.PID == 0x1FFF { // null packets are stuffing and carry no semantics
 			continue
 		}
@@ -310,6 +338,17 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 		PayloadBytes:  payloadTotal,
 		Media:         media,
 	}, nil
+}
+
+// firstDeferredError returns the earliest per-packet header failure collected
+// while pes=bounded delays the verdict, or nil when none was deferred.
+func firstDeferredError(pktErrs []*AuditError) *AuditError {
+	for _, e := range pktErrs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 func bytesEqual(a, b []byte) bool {

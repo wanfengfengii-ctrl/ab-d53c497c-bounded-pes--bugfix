@@ -432,6 +432,79 @@ func smokeCases(base string) []check {
 			},
 		},
 		{
+			name: "bounded PES: earlier missing-PUSI beats later bad sync",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				b.AddPayload(b.Opt.Media[0].PID) // packet 3: first payload, CC legal, PUSI clear
+				b.AddPayload(b.Opt.Media[0].PID) // packet 4: CC legal ...
+				b.MutateLast(func(buf []byte) { buf[0] = 0x00 })
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCodePID(body, "TS_PES_MISSING_PUSI", 3, b.Opt.Media[0].PID)
+			},
+		},
+		{
+			name: "bounded PES: single missing-PUSI control reported",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				b.AddPayload(b.Opt.Media[0].PID) // packet 3: only error, PUSI clear
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCodePID(body, "TS_PES_MISSING_PUSI", 3, b.Opt.Media[0].PID)
+			},
+		},
+		{
+			name: "bounded PES: single bad-sync control still reported",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				b.AddPayload(b.Opt.Media[0].PID)
+				b.MutateLast(func(buf []byte) { buf[0] = 0x00 }) // packet 3 only error
+				resp, body, err := auditQuery(b.Bytes(), "application/octet-stream", "maxPcrGapMs=1000&pes=bounded")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCodeNoPID(body, "TS_BAD_SYNC_BYTE", 3)
+			},
+		},
+		{
+			name: "bounded PES omitted: later bad sync stays the legacy verdict",
+			fn: func() error {
+				b := tsbuild.New()
+				b.AddPAT().AddPMT()
+				b.AddPCR(b.Opt.PCRPID, 0)
+				b.AddPayload(b.Opt.Media[0].PID) // packet 3: missing PUSI, unchecked without pes=bounded
+				b.AddPayload(b.Opt.Media[0].PID) // packet 4: corrupt header
+				b.MutateLast(func(buf []byte) { buf[0] = 0x00 })
+				resp, body, err := audit(b.Bytes(), "application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCodeNoPID(body, "TS_BAD_SYNC_BYTE", 4)
+			},
+		},
+		{
 			name: "invalid pes parameter rejected",
 			fn: func() error {
 				resp, body, err := auditQuery(good(), "application/octet-stream", "maxPcrGapMs=1000&pes=full")
@@ -507,6 +580,26 @@ func expectCode(body map[string]any, code string, packet int) error {
 	}
 	if _, partial := body["report"]; partial {
 		return fmt.Errorf("partial report present on failure")
+	}
+	return nil
+}
+
+func expectCodePID(body map[string]any, code string, packet, pid int) error {
+	if err := expectCode(body, code, packet); err != nil {
+		return err
+	}
+	if int(body["pid"].(float64)) != pid {
+		return fmt.Errorf("pid=%v want %d", body["pid"], pid)
+	}
+	return nil
+}
+
+func expectCodeNoPID(body map[string]any, code string, packet int) error {
+	if err := expectCode(body, code, packet); err != nil {
+		return err
+	}
+	if v, ok := body["pid"]; ok {
+		return fmt.Errorf("pid=%v must be absent", v)
 	}
 	return nil
 }

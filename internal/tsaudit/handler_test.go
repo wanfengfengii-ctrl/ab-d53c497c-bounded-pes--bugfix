@@ -179,6 +179,48 @@ func TestHTTPPESBoundedViolation(t *testing.T) {
 	}
 }
 
+func TestHTTPPESBoundedFirstViolationWinsOverLaterBadSync(t *testing.T) {
+	// Packet 3 is the first media payload without PUSI; packet 4 carries a
+	// corrupt sync byte. With pes=bounded the earlier bounded-PES violation
+	// must be the single verdict, and the later header error cannot mask it.
+	stream := multiErrorBoundedFragment()
+	status, body := doAudit(t, stream, "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["ok"] != false {
+		t.Fatalf("ok = %v, want false", body["ok"])
+	}
+	if body["error"].(map[string]any)["code"] != tsaudit.ErrPESMissingPUSI {
+		t.Fatalf("code=%v want %s", body["error"], tsaudit.ErrPESMissingPUSI)
+	}
+	if body["packet"].(float64) != 3 {
+		t.Errorf("packet = %v, want 3", body["packet"])
+	}
+	if body["pid"].(float64) != 0x0101 {
+		t.Errorf("pid = %v, want 257", body["pid"])
+	}
+	if _, ok := body["report"]; ok {
+		t.Fatal("partial report must not be returned on failure")
+	}
+
+	// Compatibility: omitting pes keeps the legacy verdict order, so the
+	// packet-header corruption is what the base audit reports.
+	status, body = doAudit(t, stream, "maxPcrGapMs=1000", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("legacy status=%d body=%v", status, body)
+	}
+	if body["error"].(map[string]any)["code"] != tsaudit.ErrBadSyncByte {
+		t.Fatalf("legacy code=%v want %s", body["error"], tsaudit.ErrBadSyncByte)
+	}
+	if body["packet"].(float64) != 4 {
+		t.Errorf("legacy packet = %v, want 4", body["packet"])
+	}
+	if _, ok := body["pid"]; ok {
+		t.Errorf("bad sync byte carries no PID, got %v", body["pid"])
+	}
+}
+
 func TestHTTPTooLarge(t *testing.T) {
 	big := make([]byte, tsaudit.MaxBodyBytes+188)
 	for i := range big {
