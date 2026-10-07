@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"mpegtsaudit/internal/tsaudit"
+	"mpegtsaudit/internal/tsbuild"
 )
 
 func doAudit(t *testing.T, body []byte, query, ctype string) (int, map[string]any) {
@@ -176,6 +177,72 @@ func TestHTTPPESBoundedViolation(t *testing.T) {
 	}
 	if _, ok := body["report"]; ok {
 		t.Fatal("partial report must not be returned on failure")
+	}
+}
+
+func TestHTTPPESBoundedEarliestViolationBeatsBadSync(t *testing.T) {
+	// Multi-error stream: a missing-PUSI payload at packet 3 precedes a packet
+	// with a destroyed sync byte at packet 4. With pes=bounded the earlier
+	// bounded-PES violation is the verdict; the later header error is not.
+	status, body := doAudit(t, multiErrorStream(), "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["ok"] != false {
+		t.Fatalf("ok must be false, got %v", body["ok"])
+	}
+	if body["error"].(map[string]any)["code"] != tsaudit.ErrPESMissingPUSI {
+		t.Fatalf("body=%v", body)
+	}
+	if body["packet"].(float64) != 3 {
+		t.Errorf("packet = %v, want 3", body["packet"])
+	}
+	if body["pid"].(float64) != 0x0101 {
+		t.Errorf("pid = %v, want 257", body["pid"])
+	}
+	if _, ok := body["report"]; ok {
+		t.Fatal("partial report must not be returned on failure")
+	}
+}
+
+func TestHTTPLegacyOrderingUnchangedWithoutPESParam(t *testing.T) {
+	// Omitting pes keeps the historical verdict: the bad sync byte at packet 4
+	// is reported, with no pid field in the response.
+	status, body := doAudit(t, multiErrorStream(), "maxPcrGapMs=1000", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["error"].(map[string]any)["code"] != tsaudit.ErrBadSyncByte {
+		t.Fatalf("body=%v", body)
+	}
+	if body["packet"].(float64) != 4 {
+		t.Errorf("packet = %v, want 4", body["packet"])
+	}
+	if _, ok := body["pid"]; ok {
+		t.Errorf("pid must stay absent for a bad sync byte, got %v", body["pid"])
+	}
+}
+
+func TestHTTPPESBoundedSingleBadSyncStillReported(t *testing.T) {
+	// Control stream: only the bad sync byte is a located error.
+	b := tsbuild.New()
+	b.AddPAT()
+	b.AddPMT()
+	b.AddPCR(b.Opt.PCRPID, 0)
+	b.AddPES(b.Opt.Media[0].PID, 0xE0, 100)
+	d := append(b.Bytes(), make([]byte, 188)...)
+	status, body := doAudit(t, d, "maxPcrGapMs=1000&pes=bounded", "application/octet-stream")
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	if body["error"].(map[string]any)["code"] != tsaudit.ErrBadSyncByte {
+		t.Fatalf("body=%v", body)
+	}
+	if body["packet"].(float64) != 4 {
+		t.Errorf("packet = %v, want 4", body["packet"])
+	}
+	if _, ok := body["pid"]; ok {
+		t.Errorf("pid must stay absent, got %v", body["pid"])
 	}
 }
 

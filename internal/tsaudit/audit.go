@@ -76,33 +76,62 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	pkts := make([]*Packet, n)
 
 	// ---- Pass A: per-packet header rules + PAT collection ----------------
+	// With pes=bounded the verdict must be the earliest violation in input
+	// order, so a fatal header/PSI error does not abort the audit immediately:
+	// it is remembered in earlyErr, parsing stops at that packet, and the
+	// later passes examine only the valid prefix. A concrete violation located
+	// before earlyErr then wins (see Pass C); otherwise earlyErr is returned.
+	// Without the bounded layer the first error still aborts, exactly as before.
+	var earlyErr *AuditError
+	parsed := n
 	var pats []*tableSection
 	for i := 0; i < n; i++ {
 		off := i * packetSize
 		raw := data[off : off+packetSize : off+packetSize]
 		p, err := parsePacket(raw, i)
 		if err != nil {
-			return nil, err
+			if !pesBounded {
+				return nil, err
+			}
+			earlyErr, parsed = err, i
+			break
 		}
 		pkts[i] = p
 
 		if p.HasAdaptation && len(p.Adaptation) > 0 && p.Adaptation[0]&afFlagDiscontinuity != 0 {
-			return nil, auditError(ErrDiscontinuity, "adaptation field discontinuity indicator set", i, p.PID)
+			err := auditError(ErrDiscontinuity, "adaptation field discontinuity indicator set", i, p.PID)
+			if !pesBounded {
+				return nil, err
+			}
+			earlyErr, parsed = err, i
+			break
 		}
 
 		if p.PID == pidPAT {
 			if !p.PUSI {
-				return nil, auditError(ErrPATSectionSpansPacket, "PAT continuation packet: section is not contained in one packet", i, p.PID)
+				err := auditError(ErrPATSectionSpansPacket, "PAT continuation packet: section is not contained in one packet", i, p.PID)
+				if !pesBounded {
+					return nil, err
+				}
+				earlyErr, parsed = err, i
+				break
 			}
 			sec, err := parseTablePacket(raw, p, i, 0x00, ErrPATTableID, ErrPATSectionSpansPacket, ErrSectionTruncated)
 			if err != nil {
-				return nil, err
+				if !pesBounded {
+					return nil, err
+				}
+				earlyErr, parsed = err, i
+				break
 			}
 			pats = append(pats, sec)
 		}
 	}
 
 	if len(pats) == 0 {
+		if earlyErr != nil {
+			return nil, earlyErr
+		}
 		return nil, auditError(ErrPATNotFound, "no PAT found on PID 0x0000", 0, pidPAT)
 	}
 	pat := pats[0]
@@ -123,8 +152,13 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	}
 
 	// ---- Pass B: PMT collection on the PAT-signalled PID -----------------
+	// Only packets with valid headers are inspected (parsed may stop short of
+	// a deferred packet-header failure). PMT/PSI failures are located on the
+	// signalling PID and always precede media payloads, so they keep their
+	// immediate verdict even in bounded mode.
 	var pmts []*tableSection
-	for i, p := range pkts {
+	for i := 0; i < parsed; i++ {
+		p := pkts[i]
 		if p.PID != prog.pid {
 			continue
 		}
@@ -139,6 +173,9 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 		pmts = append(pmts, sec)
 	}
 	if len(pmts) == 0 {
+		if earlyErr != nil {
+			return nil, earlyErr
+		}
 		return nil, auditError(ErrPMTNotFound, "no PMT found on the PAT-signalled PID", 0, prog.pid)
 	}
 	pmt := pmts[0]
@@ -191,20 +228,48 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 	var pcrCount int
 	var payloadTotal int64
 
-	for i, p := range pkts {
+	// fatal records a violation located at a concrete packet. In the legacy
+	// path it is the verdict immediately. With pes=bounded it is kept only when
+	// it is earlier than the violation already recorded; the caller then skips
+	// the remaining per-packet checks. The smallest located violation becomes
+	// the single verdict after the loop, so a later packet-header failure can
+	// never mask an earlier bounded-PES (or other payload) violation.
+	fatal := func(e *AuditError) bool {
+		if !pesBounded {
+			earlyErr = e
+			return true
+		}
+		if earlyErr == nil || e.Packet < earlyErr.Packet {
+			earlyErr = e
+		}
+		return false
+	}
+
+packetLoop:
+	for i := 0; i < parsed; i++ {
+		p := pkts[i]
 		if p.PID == 0x1FFF { // null packets are stuffing and carry no semantics
 			continue
 		}
 		if p.PID != pidPAT && !declared[p.PID] {
-			return nil, auditError(ErrUnknownPID, "packet on PID not declared by PAT/PMT", i, p.PID)
+			if fatal(auditError(ErrUnknownPID, "packet on PID not declared by PAT/PMT", i, p.PID)) {
+				return nil, earlyErr
+			}
+			continue
 		}
 
 		if v, hasFlag, ok := p.pcr(); hasFlag {
 			if !ok {
-				return nil, auditError(ErrPCRNoBase, "PCR flag set but PCR field is truncated", i, p.PID)
+				if fatal(auditError(ErrPCRNoBase, "PCR flag set but PCR field is truncated", i, p.PID)) {
+					return nil, earlyErr
+				}
+				continue packetLoop
 			}
 			if p.PID != pmt.pcrPID {
-				return nil, auditError(ErrPCROnWrongPID, "PCR may only appear on the PMT-declared PCR PID", i, p.PID)
+				if fatal(auditError(ErrPCROnWrongPID, "PCR may only appear on the PMT-declared PCR PID", i, p.PID)) {
+					return nil, earlyErr
+				}
+				continue packetLoop
 			}
 			ref := &PCRRef{Packet: i, Base: v / 300, Extension: int(v % 300), Value27MHz: v}
 			if pcrCount == 0 {
@@ -216,10 +281,16 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 					d += pcrCycle
 				}
 				if d < 0 {
-					return nil, auditError(ErrPCRReversed, "PCR moved backwards after 33-bit unwrap", i, p.PID)
+					if fatal(auditError(ErrPCRReversed, "PCR moved backwards after 33-bit unwrap", i, p.PID)) {
+						return nil, earlyErr
+					}
+					continue packetLoop
 				}
 				if d > int64(maxPcrGapMs)*27000 {
-					return nil, auditError(ErrPCRGapExceeded, "PCR interval exceeds maxPcrGapMs", i, p.PID)
+					if fatal(auditError(ErrPCRGapExceeded, "PCR interval exceeds maxPcrGapMs", i, p.PID)) {
+						return nil, earlyErr
+					}
+					continue packetLoop
 				}
 				unwrappedPCR += d
 				ref.Value27MHz = unwrappedPCR
@@ -239,14 +310,24 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 			}
 			if st.started {
 				if p.HasPayload {
-					if p.CC == st.cc {
-						return nil, auditError(ErrCCDuplicatePayload, "continuity counter repeated on a payload-bearing packet", i, p.PID)
+					var ccErr *AuditError
+					switch {
+					case p.CC == st.cc:
+						ccErr = auditError(ErrCCDuplicatePayload, "continuity counter repeated on a payload-bearing packet", i, p.PID)
+					case p.CC != (st.cc+1)&0x0F:
+						ccErr = auditError(ErrCCGap, "continuity counter did not increment modulo 16", i, p.PID)
 					}
-					if want := (st.cc + 1) & 0x0F; p.CC != want {
-						return nil, auditError(ErrCCGap, "continuity counter did not increment modulo 16", i, p.PID)
+					if ccErr != nil {
+						if fatal(ccErr) {
+							return nil, earlyErr
+						}
+						continue packetLoop
 					}
 				} else if p.CC != st.cc {
-					return nil, auditError(ErrCCGap, "adaptation-only packet must keep the continuity counter unchanged", i, p.PID)
+					if fatal(auditError(ErrCCGap, "adaptation-only packet must keep the continuity counter unchanged", i, p.PID)) {
+						return nil, earlyErr
+					}
+					continue packetLoop
 				}
 			}
 			st.started = true
@@ -263,9 +344,17 @@ func audit(data []byte, maxPcrGapMs int, pesBounded bool) (*Report, *AuditError)
 		if st := pes[p.PID]; st != nil && p.HasPayload {
 			payload := data[i*packetSize+p.PayloadStart : (i+1)*packetSize]
 			if err := st.consume(payload, p.PUSI, i, p.PID); err != nil {
-				return nil, err
+				if fatal(err) {
+					return nil, earlyErr
+				}
 			}
 		}
+	}
+
+	// A violation located at a concrete packet always outranks end-of-stream
+	// conditions such as a missing PCR or PES.
+	if earlyErr != nil {
+		return nil, earlyErr
 	}
 
 	if pcrCount == 0 {
