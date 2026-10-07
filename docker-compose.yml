@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    image: mpegts-audit:latest
+    environment:
+      PORT: "8080"
+    ports:
+      # Host-side port is configurable: HOST_PORT=9090 docker compose up app
+      - "${HOST_PORT:-8080}:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+  verify:
+    build:
+      context: .
+      target: verify
+    image: mpegts-audit-verify:latest
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      AUDIT_BASE_URL: "http://app:8080"
+    restart: "no"

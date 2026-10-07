@@ -1,0 +1,10 @@
+# build artifacts
+/out/
+*.test
+*.out
+
+# local env / editor
+.env
+.idea/
+.vscode/
+.DS_Store
